@@ -5,10 +5,11 @@ import importlib
 import sys
 
 from ida_angr_lib.log import logger
+from ida_angr_lib.globals import simgr
 
 
 sys.dont_write_bytecode = True
-
+my_hooks = None
 
 def clear_module_cache(module_name):
     if module_name in sys.modules:
@@ -70,11 +71,11 @@ class my_hooks_t(ida_kernwin.UI_Hooks):
         if widget_type == ida_kernwin.BWN_PSEUDOCODE:
             logger.debug("Widget type is PSEUDOCODE")
             res = ida_kernwin.attach_action_to_popup(widget, popup, ACTION_NAME)
-            logger.debug("Attach action to popup result:", res)
+            logger.debug(f"Attach action to popup result: {res}")
 
-my_hooks = None
 
 class AngrPlugin(idaapi.plugin_t):
+    
     flags = idaapi.PLUGIN_KEEP
     comment = "Angr integration plugin"
     help = "Integrates angr with IDA Pro"
@@ -94,6 +95,9 @@ class AngrPlugin(idaapi.plugin_t):
 
     def term(self):
         logger.debug("Terminating Angr Plugin")
+
+        # idk why but this is called immediately after init?
+        
         """
         if my_hooks:
             my_hooks.unhook()

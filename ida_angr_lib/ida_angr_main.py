@@ -5,12 +5,18 @@ import ida_funcs
 import ida_name
 import ida_kernwin
 import ida_nalt
+import idc 
+import ida_idaapi
+
 
 import angr
 import re
 import os
 import pickle
-
+import threading
+import time
+import builtins
+import json
 
 from ida_angr_lib.log import logger
 from ida_angr_lib import globals
@@ -21,15 +27,31 @@ from angr.sim_type import SimTypePointer, SimTypeInt, SimTypeChar, SimTypeFloat,
 # maybe use archinfo?
 
 
+# Global variable to stop analysis and related lock
+should_stop = False
+should_stop_lock = threading.Lock()
+start_time = time.time()
+
+# Event to signal the completion of the exploration
+exploration_done_event = threading.Event()
+
+def get_suffix_path_relative_to_idb(suffix):
+
+    binary_path = globals.binary_path
+    basename = os.path.basename(binary_path)
+    suffixed_path = basename + suffix
+    basepath = os.path.dirname(binary_path)
+    return os.path.join(basepath, suffixed_path)
+
 def create_angr_project():
 
-    binary_path = ida_nalt.get_input_file_path()
-    globals.binary_path = binary_path
+    binary_path = globals.binary_path
     basename = os.path.basename(binary_path)
     proj_cache_file = basename + ".proj.pickle"
+    cfg_cache_file = basename + ".cfg.pickle"
     basepath = os.path.dirname(binary_path)
     proj_cache_file = os.path.join(basepath, proj_cache_file)
-    
+    cfg_cache_file = os.path.join(basepath, cfg_cache_file)
     logger.debug("Loading project...")
 
     if os.path.exists(proj_cache_file):
@@ -50,7 +72,16 @@ def create_angr_project():
     logger.debug("Running CFG analysis")
 
     # Get control flow graph.
-    globals.cfg = globals.proj.analyses.CFGFast()
+    if os.path.exists(cfg_cache_file):
+        logger.debug(f"Found cache file {cfg_cache_file}, loading it...")
+        with open(cfg_cache_file, "rb") as f:
+            globals.cfg = pickle.load(f)
+    else:
+        globals.cfg = globals.proj.analyses.CFGFast()
+        with open(cfg_cache_file, "wb") as f:
+            pickle.dump(globals.cfg, f, protocol=-1)
+
+    logger.debug("CFG ready")
     return True
 
 
@@ -215,10 +246,7 @@ def inspect_call(state):
         pass
 
 
-
-def build_call_state(ea):
-
-    prototype, prototype_arg_str = get_function_prototype(ea)
+def build_call_state_async(prototype, prototype_arg_str, ea):
 
     logger.debug(prototype)
 
@@ -256,6 +284,106 @@ def build_call_state(ea):
     # state.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY)
     state.inspect.b('call', when=angr.BP_BEFORE, action=inspect_call)
     #state.inspect.b('constraints', when=angr.BP_AFTER, action=inspect_new_constraint)
+
+
+    # Load the JSON file
+    addresses_path = os.path.join(os.path.dirname(__file__), "addresses.json")
+    with open(addresses_path, 'r') as f:
+        data = json.load(f)
+
+    # Extract the find and avoid addresses
+    find_addresses = [int(item['address'], 16) if item['address'].startswith('0x') else item['address'] for item in data['find']]
+    avoid_addresses = [int(item['address'], 16) if item['address'].startswith('0x') else item['address'] for item in data['avoid']]
+
     globals.simgr = globals.proj.factory.simgr(state)
 
     logger.debug(globals.simgr.active[0].regs.rip)
+
+    globals.simgr = globals.proj.factory.simulation_manager(state)
+
+    class ClockWatcher(angr.exploration_techniques.ExplorationTechnique):
+
+        def __init__(self, timeout):
+            super().__init__()
+
+            self.timeout = timeout
+            self.start_time = time.time()
+            logger.debug(f"Timeout set at {self.timeout}")
+
+        def step(self, simgr, stash='active', **kwargs):
+            with should_stop_lock:
+                if should_stop:
+                    logger.debug("User cancelled!")
+                    simgr.move(from_stash="active", to_stash="timeout")
+                    return simgr
+                
+            if time.time() - self.start_time > self.timeout:
+                logger.debug(f"Analysis timeout")
+                simgr.move(from_stash="active", to_stash="timeout")
+                return simgr
+                
+            return simgr.step(stash=stash, **kwargs)
+    
+    globals.simgr.use_technique(ClockWatcher(timeout=30))
+    logger.debug("Exploring...")
+    
+    # Use the extracted addresses in your explore function
+    globals.simgr.explore(find=find_addresses, avoid=avoid_addresses)
+    
+    # Signal that the exploration is done
+    exploration_done_event.set()
+
+    s = globals.simgr
+    logger.debug(f'active: {len(s.active)}')
+    logger.debug(f'found: {len(s.found)}')
+    logger.debug(f'avoid: {len(s.avoid)}')
+    logger.debug(f'deadended: {len(s.deadended)}')
+    logger.debug(f'errored: {len(s.errored)}')
+    logger.debug(f'unsat: {len(s.unsat)}')
+    logger.debug(f'uncons: {len(s.unconstrained)}')
+    logger.debug(f'timeout: {len(s.timeout) if hasattr(s, "timeout") else 0}')
+
+    builtins.__dict__['simgr'] = globals.simgr
+    
+    logger.debug("Injected globals.simgr into builtins")
+
+    if len(s.found) > 0:
+        simgr_cache_path = get_suffix_path_relative_to_idb(".simgr.pickle")
+        with open(simgr_cache_path, 'wb') as f:
+            pickle.dump(globals.simgr, f, protocole=-1)
+        logger.debug(f"Dumped simgr to {simgr_cache_path}")
+
+def build_call_state(ea):
+
+    global should_stop
+    #ida_idaapi.set_script_timeout(15)
+
+    with should_stop_lock:
+        should_stop = False
+
+    prototype, prototype_arg_str = get_function_prototype(ea)
+    globals.binary_path = ida_nalt.get_input_file_path()
+
+    ida_kernwin.show_wait_box("angr is exploring....")
+
+    exploration_thread = threading.Thread(target=build_call_state_async, args=(prototype, prototype_arg_str, ea,))
+    exploration_thread.start()
+
+    try:
+        # Periodically check if the exploration is done
+        while not exploration_done_event.is_set():
+            if ida_kernwin.user_cancelled() or time.time() - start_time > 30:
+                logger.debug("Aborting...")
+                with should_stop_lock:
+                    should_stop = True
+             
+                break
+
+            idc.qsleep(100)  # Sleep for 100 ms to avoid busy-waiting
+    finally:
+        ida_kernwin.hide_wait_box()
+    
+    if should_stop:
+        print("Exploration was cancelled.")
+    else:
+        print("Exploration completed.")
