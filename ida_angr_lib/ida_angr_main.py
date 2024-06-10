@@ -17,9 +17,12 @@ import threading
 import time
 import builtins
 import json
+import importlib
 
 from ida_angr_lib.log import logger
 from ida_angr_lib import globals
+from ida_angr_lib import hooks
+importlib.reload(hooks)
 
 from angr.sim_type import SimTypePointer, SimTypeInt, SimTypeChar, SimTypeFloat, SimTypeDouble, SimTypeArray, SimStruct
 
@@ -334,8 +337,12 @@ def build_call_state_async(prototype, prototype_arg_str, ea):
         prototype=prototype
     )
 
-    # state.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS)
-    # state.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY)
+    state.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS)
+    state.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY)
+
+    globals.proj.hook_symbol('__acrt_iob_func', hooks.acrt_iob_func())
+    globals.proj.hook_symbol('__stdio_common_vfprintf', hooks.stdio_common_vfprintf())
+
     globals.state.inspect.b('call', when=angr.BP_BEFORE, action=inspect_call)
     #state.inspect.b('constraints', when=angr.BP_AFTER, action=inspect_new_constraint)
     builtins.__dict__['state'] = globals.state
@@ -345,7 +352,7 @@ def build_call_state_async(prototype, prototype_arg_str, ea):
 def explore_async():
 
     # Load the JSON file
-    addresses_path = os.path.join(os.path.dirname(__file__), "addresses.json")
+    addresses_path = get_path_relative_to_idb("addresses.json")
 
     if not os.path.exists(addresses_path):
         logger.warning(f"You must create and populate {addresses_path} first")
@@ -365,7 +372,7 @@ def explore_async():
     globals.simgr = globals.proj.factory.simulation_manager(state)
     
     globals.simgr.use_technique(ClockWatcher(timeout=g_timeout))
-    logger.debug("Exploring...")
+    logger.debug(f"Exploring...find={find_addresses}, avoid={avoid_addresses}")
     
     # Use the extracted addresses in your explore function
     globals.simgr.explore(find=find_addresses, avoid=avoid_addresses)
@@ -390,7 +397,7 @@ def explore_async():
     if len(s.found) > 0:
         simgr_cache_path = get_suffix_path_relative_to_idb(".simgr.pickle")
         with open(simgr_cache_path, 'wb') as f:
-            pickle.dump(globals.simgr, f, protocole=-1)
+            pickle.dump(globals.simgr, f, protocol=-1)
         logger.debug(f"Dumped simgr to {simgr_cache_path}")
 
 
