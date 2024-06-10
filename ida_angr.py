@@ -84,22 +84,19 @@ def register_action():
         -1
     )
 
-    logger.debug("Action description (Build call state):", action_desc_build_call_state)
-    logger.debug("Action description (Explore from here):", action_desc_explore_from_here)
-
     # Register the actions
     res1 = ida_kernwin.register_action(action_desc_build_call_state)
     res2 = ida_kernwin.register_action(action_desc_explore_from_here)
-    logger.debug("Register action result (Build call state):", res1)
-    logger.debug("Register action result (Explore from here):", res2)
+    logger.debug(f"Register action result (Build call state): {res1}")
+    logger.debug(f"Register action result (Explore from here): {res2}")
 
     return res1 and res2
 
 def unregister_action():
     res1 = ida_kernwin.unregister_action(ACTION_NAME_BUILD_CALL_STATE)
     res2 = ida_kernwin.unregister_action(ACTION_NAME_EXPLORE_FROM_HERE)
-    logger.debug("Unregister action result (Build call state):", res1)
-    logger.debug("Unregister action result (Explore from here):", res2)
+    logger.debug(f"Unregister action result (Build call state): {res1}")
+    logger.debug(f"Unregister action result (Explore from here): {res2}")
 
 class my_hooks_t(ida_kernwin.UI_Hooks):
     def populating_widget_popup(self, widget, popup):

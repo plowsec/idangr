@@ -139,6 +139,8 @@ def create_symbolic_variable(state, param_type_str, param_name):
     # Type aliases
     if param_type_str == "ULONG*":
         param_type_str = "unsigned int*"
+    elif "_DWORD" in param_type_str:
+        param_type_str = param_type_str.replace("_DWORD", "int") # cparser doesn't like it
 
     param_type = angr.sim_type.parse_type(param_type_str, arch=state.arch)
 
@@ -218,6 +220,14 @@ def get_function_prototype(ea):
     if not func_name:
         logger.error("Failed to get the function name.")
         return
+
+    if "(" in func_name:
+        func_name = func_name[:func_name.index('(')]
+
+    if " " in func_name:
+        func_name = func_name.split()[-1]
+
+    logger.debug(f"Long name: {func_name}")
     
     # Decompile the function
     cfunc = ida_hexrays.decompile(func)
@@ -228,6 +238,8 @@ def get_function_prototype(ea):
     # Get the function prototype
     prototype = cfunc.type
     prototype_str = str(prototype)
+
+    logger.debug(f"prototype_str: {prototype_str}")
     
     # Insert the function name into the prototype string
     # Find the position to insert the function name
@@ -239,6 +251,8 @@ def get_function_prototype(ea):
     # Construct the full prototype with the function name
     full_prototype = prototype_str[:insert_pos] + ' ' + func_name + prototype_str[insert_pos:]
     full_prototype = full_prototype.replace("__fastcall ", "")
+    full_prototype = full_prototype.replace("__stdcall ", "")
+    full_prototype = full_prototype.replace("__cdecl", "")
     full_prototype = full_prototype.replace("__int64", "int64_t")
     full_prototype = full_prototype.replace("ULONG *", "unsigned int*")
     return full_prototype, prototype_str[insert_pos:]
@@ -312,6 +326,7 @@ def build_call_state_async(prototype, prototype_arg_str, ea):
 
     globals.mycc = angr.calling_conventions.SimCCMicrosoftAMD64(globals.proj.arch)
 
+    logger.debug(f"Prototype: {prototype}")
     globals.state = globals.proj.factory.call_state(
         ea,
         *symbolic_args,
