@@ -12,6 +12,22 @@ Windows:
 
 %AppData%\Roaming\Hex-Rays\IDA Pro\plugins
 
+## Dependencies
+
+Only `angr` for now. Install it from `pip` for the Python interpreter used by IDA.
+
+Windows:
+
+```
+& 'C:\Program Files\Python310\python.exe' -m pip install angr
+```
+
+Linux:
+
+```
+python3 -m pip install angr
+```
+
 # Usage
 
 Right-click within Hex-Rays and select "Build call state". This will create an angr call state and automatically define symbolic variables for every parameter of the function. Then you can use it in the Python console like this:
