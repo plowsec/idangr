@@ -5,6 +5,7 @@ mycc = None
 cfg = None
 phase = 1
 simgr = None
+state = None
 driver_path = ""
 
 eval_upto = 3

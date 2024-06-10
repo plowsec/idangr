@@ -35,6 +35,38 @@ start_time = time.time()
 # Event to signal the completion of the exploration
 exploration_done_event = threading.Event()
 
+config_path = os.path.join(os.path.dirname(__file__), "config.json")
+
+with open(config_path, "r") as f:
+    config = json.load(f)
+
+g_timeout = config['timeout']
+
+
+class ClockWatcher(angr.exploration_techniques.ExplorationTechnique):
+
+    def __init__(self, timeout):
+        super().__init__()
+
+        self.timeout = timeout
+        self.start_time = time.time()
+        logger.debug(f"Timeout set at {self.timeout}")
+
+    def step(self, simgr, stash='active', **kwargs):
+        with should_stop_lock:
+            if should_stop:
+                logger.debug("User cancelled!")
+                simgr.move(from_stash="active", to_stash="timeout")
+                return simgr
+            
+        if time.time() - self.start_time > self.timeout:
+            logger.debug(f"Analysis timeout")
+            simgr.move(from_stash="active", to_stash="timeout")
+            return simgr
+            
+        return simgr.step(stash=stash, **kwargs)
+
+
 def get_suffix_path_relative_to_idb(suffix):
 
     binary_path = globals.binary_path
@@ -42,6 +74,13 @@ def get_suffix_path_relative_to_idb(suffix):
     suffixed_path = basename + suffix
     basepath = os.path.dirname(binary_path)
     return os.path.join(basepath, suffixed_path)
+
+def get_path_relative_to_idb(path):
+
+    binary_path = globals.binary_path
+    basepath = os.path.dirname(binary_path)
+    return os.path.join(basepath, path)
+
 
 def create_angr_project():
 
@@ -273,7 +312,7 @@ def build_call_state_async(prototype, prototype_arg_str, ea):
 
     globals.mycc = angr.calling_conventions.SimCCMicrosoftAMD64(globals.proj.arch)
 
-    state = globals.proj.factory.call_state(
+    globals.state = globals.proj.factory.call_state(
         ea,
         *symbolic_args,
         cc=globals.mycc,
@@ -282,12 +321,21 @@ def build_call_state_async(prototype, prototype_arg_str, ea):
 
     # state.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS)
     # state.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY)
-    state.inspect.b('call', when=angr.BP_BEFORE, action=inspect_call)
+    globals.state.inspect.b('call', when=angr.BP_BEFORE, action=inspect_call)
     #state.inspect.b('constraints', when=angr.BP_AFTER, action=inspect_new_constraint)
+    builtins.__dict__['state'] = globals.state
+    builtins.__dict__['proj'] = globals.proj
 
+
+def explore_async():
 
     # Load the JSON file
     addresses_path = os.path.join(os.path.dirname(__file__), "addresses.json")
+
+    if not os.path.exists(addresses_path):
+        logger.warning(f"You must create and populate {addresses_path} first")
+        return
+
     with open(addresses_path, 'r') as f:
         data = json.load(f)
 
@@ -300,31 +348,8 @@ def build_call_state_async(prototype, prototype_arg_str, ea):
     logger.debug(globals.simgr.active[0].regs.rip)
 
     globals.simgr = globals.proj.factory.simulation_manager(state)
-
-    class ClockWatcher(angr.exploration_techniques.ExplorationTechnique):
-
-        def __init__(self, timeout):
-            super().__init__()
-
-            self.timeout = timeout
-            self.start_time = time.time()
-            logger.debug(f"Timeout set at {self.timeout}")
-
-        def step(self, simgr, stash='active', **kwargs):
-            with should_stop_lock:
-                if should_stop:
-                    logger.debug("User cancelled!")
-                    simgr.move(from_stash="active", to_stash="timeout")
-                    return simgr
-                
-            if time.time() - self.start_time > self.timeout:
-                logger.debug(f"Analysis timeout")
-                simgr.move(from_stash="active", to_stash="timeout")
-                return simgr
-                
-            return simgr.step(stash=stash, **kwargs)
     
-    globals.simgr.use_technique(ClockWatcher(timeout=30))
+    globals.simgr.use_technique(ClockWatcher(timeout=g_timeout))
     logger.debug("Exploring...")
     
     # Use the extracted addresses in your explore function
@@ -353,6 +378,7 @@ def build_call_state_async(prototype, prototype_arg_str, ea):
             pickle.dump(globals.simgr, f, protocole=-1)
         logger.debug(f"Dumped simgr to {simgr_cache_path}")
 
+
 def build_call_state(ea):
 
     global should_stop
@@ -364,15 +390,37 @@ def build_call_state(ea):
     prototype, prototype_arg_str = get_function_prototype(ea)
     globals.binary_path = ida_nalt.get_input_file_path()
 
+    ida_kernwin.show_wait_box("Building call state....")
+
+    try:
+            
+        e = threading.Thread(target=build_call_state_async, args=(prototype, prototype_arg_str, ea,))
+        e.start()
+        e.join()
+
+    finally:
+        ida_kernwin.hide_wait_box()
+
+
+def explore_from_here(ea):
+
+    if globals.state is None:
+        build_call_state(ea)
+
+    global should_stop
+
+    with should_stop_lock:
+        should_stop = False
+
     ida_kernwin.show_wait_box("angr is exploring....")
 
-    exploration_thread = threading.Thread(target=build_call_state_async, args=(prototype, prototype_arg_str, ea,))
+    exploration_thread = threading.Thread(target=explore_async)
     exploration_thread.start()
 
     try:
         # Periodically check if the exploration is done
         while not exploration_done_event.is_set():
-            if ida_kernwin.user_cancelled() or time.time() - start_time > 30:
+            if ida_kernwin.user_cancelled() or time.time() - start_time > g_timeout * 2:
                 logger.debug("Aborting...")
                 with should_stop_lock:
                     should_stop = True
