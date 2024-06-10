@@ -57,7 +57,7 @@ Create `addresses.json` (next to your IDB) and fill it like this:
 }
 ```
 
-Right-click within Hex-Rays and select "Build call state". This will create an angr call state and automatically define symbolic variables for every parameter of the function. There is also "Explore from here" that does the same thing AND trigger an angr's exploration (the default one).
+Right-click within Hex-Rays and select "Build call state". This will create an angr call state and automatically define symbolic variables for every parameter of the function. There is also "Explore from here" that does the same thing AND triggers an angr's exploration (the default one).
 
 Then you can use it in the Python console like this:
 
