@@ -7,14 +7,15 @@ phase = 1
 simgr = None
 state = None
 driver_path = ""
-
+aggregated_cov = set()
 eval_upto = 3
 vulns_unique = set()
 driver_info = {}
 basic_info = {}
 vulns_info = []
 error_msgs = []
-
+painter = None
+hooked_functions = []
 
 NPD_TARGETS = ['SystemBuffer', 'Type3InputBuffer', 'UserBuffer', 'ExAllocatePool_0x', 'ExAllocatePool2_0x', 'ExAllocatePool3_0x', 'ExAllocatePoolWithTag_0x', 'MmAllocateNonCachedMemory_0x', 'MmAllocateContiguousMemorySpecifyCache_0x']
 SystemBuffer = None

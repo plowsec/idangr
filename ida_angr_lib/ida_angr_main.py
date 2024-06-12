@@ -7,7 +7,7 @@ import ida_kernwin
 import ida_nalt
 import idc 
 import ida_idaapi
-
+import idaapi
 
 import angr
 import re
@@ -18,11 +18,17 @@ import time
 import builtins
 import json
 import importlib
+import functools
+
+import PyQt5.QtCore as QtCore
 
 from ida_angr_lib.log import logger
 from ida_angr_lib import globals
 from ida_angr_lib import hooks
+from ida_angr_lib import ida_painter
+
 importlib.reload(hooks)
+importlib.reload(ida_painter)
 
 from angr.sim_type import SimTypePointer, SimTypeInt, SimTypeChar, SimTypeFloat, SimTypeDouble, SimTypeArray, SimStruct
 
@@ -46,6 +52,62 @@ with open(config_path, "r") as f:
 g_timeout = config['timeout']
 
 
+# ---------------------------------------------------------------
+class undo_handler_t(idaapi.action_handler_t):
+    """Helper internal class to execute the undo-able user function"""
+    id = 0
+    def __init__(self, callable, *args, **kwargs):
+        idaapi.action_handler_t.__init__(self)
+        self.id += 1
+        self.callable   = callable
+        self.args       = args
+        self.kwargs     = kwargs
+        self.result     = None
+
+
+    def activate(self, ctx):
+        self.result = self.callable(*self.args, **self.kwargs)
+        return 0
+
+
+    def update(self, ctx):
+        return idaapi.AST_ENABLE_ALWAYS
+
+
+
+# ---------------------------------------------------------------
+class undoable_t:
+    """Callable class that invokes the user's function via
+    process_ui_actions(). This will create an undo point and
+    hence making the function 'undoable'
+    """
+    def __init__(self, callable):
+        self.callable = callable
+
+    
+    def __call__(self, *args, **kwargs):
+        ah   = undo_handler_t(self.callable, *args, **kwargs)
+        desc = idaapi.action_desc_t(
+                    f"ida_undo_{self.callable.__name__}_{ah.id}",
+                    f"IDAPython: {self.callable.__name__}",
+                    ah)
+
+        if not idaapi.register_action(desc):
+            raise(f'Failed to register action {desc.name}')
+
+        idaapi.process_ui_action(desc.name)
+        idaapi.unregister_action(desc.name)
+
+        return ah.result
+
+
+    @staticmethod
+    def undo():
+        idaapi.process_ui_action('Undo')
+
+
+undoable = lambda callable: undoable_t(callable)
+
 class ClockWatcher(angr.exploration_techniques.ExplorationTechnique):
 
     def __init__(self, timeout):
@@ -68,6 +130,85 @@ class ClockWatcher(angr.exploration_techniques.ExplorationTechnique):
             return simgr
             
         return simgr.step(stash=stash, **kwargs)
+
+
+class ToMainthread(QtCore.QObject):
+    """
+    A Qt object whose sole purpose is to execute code on the mainthread.
+
+    Below, we define a Qt signal called 'mainthread'. Any thread can emit() this
+    signal, where it will be handled in the main application thread.
+    """
+    mainthread = QtCore.pyqtSignal(object)
+
+    def __init__(self):
+        super(ToMainthread, self).__init__()
+
+        #
+        # from any thread, one can call 'mainthread.emit(a_function)', passing
+        # in a callable object (a_function) which will be executed (through the
+        # lambda) on the main application thread.
+        #
+
+        self.mainthread.connect(lambda x: x())
+
+
+def execute_paint(function):
+    """
+    A function decorator to safely paint the IDA database from any thread.
+    """
+
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+
+        #
+        # the first argument passed to this decorator will be the
+        # IDAPainter class instance
+        #
+
+        ida_painter = args[0]
+
+        #
+        # we wrap up the remaining args (and paint function) into a single
+        # packaged up callable object (a functools.partial)
+        #
+
+        ff = functools.partial(function, *args, **kwargs)
+
+        #
+        # if we are using a 'bugged' downlevel version of IDA, package another
+        # callable to 'synchronize' a database write. This callable will get
+        # passed to the main thread and executed through the Qt event loop.
+        #
+        # the execute_sync should technically happy in-line, avoiding the
+        # possibility of deadlocks or aborts as described above.
+        #
+
+        if idaapi.IDA_SDK_VERSION < 710:
+            fff = functools.partial(idaapi.execute_sync, ff, idaapi.MFF_WRITE)
+            ida_painter._signal.mainthread.emit(fff)
+            return idaapi.BADADDR
+
+        #
+        # in IDA 7.1, the MFF_NOWAIT bug is definitely fixed, so we can just
+        # use it to schedule our paint action ... as designed.
+        #
+
+        return idaapi.execute_sync(ff, idaapi.MFF_NOWAIT | idaapi.MFF_WRITE)
+    return wrapper        
+
+
+class IDAPainter():
+
+    def __init__(self):
+
+        self._signal = ToMainthread()
+
+    @execute_paint
+    def paint_ea(self, ea):
+
+        ida_painter.color_lines(ea)
+
 
 
 def get_suffix_path_relative_to_idb(suffix):
@@ -297,9 +438,9 @@ def inspect_call(state):
     human_str = state.project.loader.describe_addr(state.addr)
     logger.debug(
         f'call {hex(state.addr)} ({human_str}) from {hex(state.history.addr)} ({state.project.loader.describe_addr(state.addr)})')
-    if "extern-address" in human_str:
-        logger.warning(f"Implement hook for {hex(state.addr)} ({human_str})")
-        pass
+    if "extern-address" in human_str and state.addr not in globals.hooked_functions:
+        logger.error(f"Implement hook for {hex(state.addr)} ({human_str})")
+        raise Exception("Hook not implemented")
 
 
 def build_call_state_async(prototype, prototype_arg_str, ea):
@@ -342,12 +483,36 @@ def build_call_state_async(prototype, prototype_arg_str, ea):
 
     globals.proj.hook_symbol('__acrt_iob_func', hooks.acrt_iob_func())
     globals.proj.hook_symbol('__stdio_common_vfprintf', hooks.stdio_common_vfprintf())
+    hooks.set_all_hooks(globals.proj, globals.hooked_functions, globals.mycc)
 
     globals.state.inspect.b('call', when=angr.BP_BEFORE, action=inspect_call)
+    #globals.state.inspect.b('instruction', when=angr.BP_BEFORE, action=instruction_hook)
     #state.inspect.b('constraints', when=angr.BP_AFTER, action=inspect_new_constraint)
     builtins.__dict__['state'] = globals.state
     builtins.__dict__['proj'] = globals.proj
 
+
+def update_coverage(*args, **kwargs):
+
+    sm = args[0]
+    
+    for state in sm.stashes["active"]:
+
+        addrs = state.history.bbl_addrs.hardcopy
+        for insn_addr in addrs:
+            if insn_addr not in globals.aggregated_cov:
+                logger.debug(f"New address: {hex(insn_addr)}")
+                globals.aggregated_cov.add(insn_addr)
+                #globals.painter.paint_ea(insn_addr)
+
+    
+def instruction_hook(state):
+
+    for addr in state.history.bbl_addrs.hardcopy:
+        if addr not in globals.aggregated_cov:
+            logger.debug(f"New address: {hex(addr)}")
+            globals.aggregated_cov.add(addr)
+            globals.painter.paint_ea(addr)
 
 def explore_async():
 
@@ -356,6 +521,7 @@ def explore_async():
 
     if not os.path.exists(addresses_path):
         logger.warning(f"You must create and populate {addresses_path} first")
+        exploration_done_event.set()
         return
 
     with open(addresses_path, 'r') as f:
@@ -372,10 +538,11 @@ def explore_async():
     globals.simgr = globals.proj.factory.simulation_manager(state)
     
     globals.simgr.use_technique(ClockWatcher(timeout=g_timeout))
+    globals.simgr.use_technique(angr.exploration_techniques.Spiller())
     logger.debug(f"Exploring...find={find_addresses}, avoid={avoid_addresses}")
-    
+    globals.aggregated_cov = set()
     # Use the extracted addresses in your explore function
-    globals.simgr.explore(find=find_addresses, avoid=avoid_addresses)
+    globals.simgr.explore(find=find_addresses, avoid=avoid_addresses, step_func=update_coverage)
     
     # Signal that the exploration is done
     exploration_done_event.set()
@@ -395,10 +562,14 @@ def explore_async():
     logger.debug("Injected globals.simgr into builtins")
 
     if len(s.found) > 0:
-        simgr_cache_path = get_suffix_path_relative_to_idb(".simgr.pickle")
-        with open(simgr_cache_path, 'wb') as f:
-            pickle.dump(globals.simgr, f, protocol=-1)
-        logger.debug(f"Dumped simgr to {simgr_cache_path}")
+        try:
+            simgr_cache_path = get_suffix_path_relative_to_idb(".simgr.pickle")
+            with open(simgr_cache_path, 'wb') as f:
+                pickle.dump(globals.simgr, f, protocol=-1)
+            logger.debug(f"Dumped simgr to {simgr_cache_path}")
+        except:
+            import traceback
+            traceback.print_exc()
 
 
 def build_call_state(ea):
@@ -424,10 +595,15 @@ def build_call_state(ea):
         ida_kernwin.hide_wait_box()
 
 
+@undoable
 def explore_from_here(ea):
 
     if globals.state is None:
         build_call_state(ea)
+
+
+    globals.painter = IDAPainter()
+
 
     global should_stop
 
@@ -457,3 +633,9 @@ def explore_from_here(ea):
         print("Exploration was cancelled.")
     else:
         print("Exploration completed.")
+
+    builtins.__dict__["aggregated_cov"] = globals.aggregated_cov
+    builtins.__dict__["painter"] = globals.painter
+
+
+    pass
